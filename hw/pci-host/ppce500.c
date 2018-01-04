@@ -423,11 +423,6 @@ static void e500_pcihost_bridge_realize(PCIDevice *d, Error **errp)
     PPCE500CCSRState *ccsr = CCSR(container_get(qdev_get_machine(),
                                   "/e500-ccsr"));
 
-    pci_config_set_class(d->config, PCI_CLASS_BRIDGE_PCI);
-    d->config[PCI_HEADER_TYPE] =
-        (d->config[PCI_HEADER_TYPE] & PCI_HEADER_TYPE_MULTI_FUNCTION) |
-        PCI_HEADER_TYPE_BRIDGE;
-
     memory_region_init_alias(&b->bar0, OBJECT(ccsr), "e500-pci-bar0", &ccsr->ccsr_space,
                              0, int128_get64(ccsr->ccsr_space.size));
     pci_register_bar(d, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &b->bar0);
@@ -508,7 +503,7 @@ static void e500_host_bridge_class_init(ObjectClass *klass, void *data)
      * PCI-facing part of the host bridge, not usable without the
      * host-facing part, which can't be device_add'ed, yet.
      */
-    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->user_creatable = false;
 }
 
 static const TypeInfo e500_host_bridge_info = {
@@ -516,6 +511,10 @@ static const TypeInfo e500_host_bridge_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PPCE500PCIBridgeState),
     .class_init    = e500_host_bridge_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
 };
 
 static Property pcihost_properties[] = {

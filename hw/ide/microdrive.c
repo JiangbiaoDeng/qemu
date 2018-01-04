@@ -24,7 +24,6 @@
  */
 #include "qemu/osdep.h"
 #include "hw/hw.h"
-#include "hw/i386/pc.h"
 #include "hw/pcmcia.h"
 #include "sysemu/block-backend.h"
 #include "sysemu/dma.h"
@@ -575,12 +574,15 @@ PCMCIACardState *dscm1xxxx_init(DriveInfo *dinfo)
 static void dscm1xxxx_class_init(ObjectClass *oc, void *data)
 {
     PCMCIACardClass *pcc = PCMCIA_CARD_CLASS(oc);
+    DeviceClass *dc = DEVICE_CLASS(oc);
 
     pcc->cis = dscm1xxxx_cis;
     pcc->cis_len = sizeof(dscm1xxxx_cis);
 
     pcc->attach = dscm1xxxx_attach;
     pcc->detach = dscm1xxxx_detach;
+    /* Reason: Needs to be wired-up in code, see dscm1xxxx_init() */
+    dc->user_creatable = false;
 }
 
 static const TypeInfo dscm1xxxx_type_info = {

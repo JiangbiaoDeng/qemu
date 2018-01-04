@@ -85,7 +85,7 @@ void xen_pt_log(const PCIDevice *d, const char *f, ...)
 static int xen_pt_pci_config_access_check(PCIDevice *d, uint32_t addr, int len)
 {
     /* check offset range */
-    if (addr >= 0xFF) {
+    if (addr > 0xFF) {
         XEN_PT_ERR(d, "Failed to access register with offset exceeding 0xFF. "
                    "(addr: 0x%02x, len: %d)\n", addr, len);
         return -1;
@@ -946,6 +946,7 @@ static void xen_pci_passthrough_class_init(ObjectClass *klass, void *data)
     k->exit = xen_pt_unregister_device;
     k->config_read = xen_pt_pci_read_config;
     k->config_write = xen_pt_pci_write_config;
+    k->is_express = 1; /* We might be */
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     dc->desc = "Assign an host PCI device with Xen";
     dc->props = xen_pci_passthrough_properties;
@@ -964,6 +965,11 @@ static const TypeInfo xen_pci_passthrough_info = {
     .instance_size = sizeof(XenPCIPassthroughState),
     .instance_finalize = xen_pci_passthrough_finalize,
     .class_init = xen_pci_passthrough_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { INTERFACE_PCIE_DEVICE },
+        { },
+    },
 };
 
 static void xen_pci_passthrough_register_types(void)
