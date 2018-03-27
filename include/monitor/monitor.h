@@ -2,8 +2,8 @@
 #define MONITOR_H
 
 #include "qemu-common.h"
-#include "qapi/qmp/qdict.h"
 #include "block/block.h"
+#include "qapi/qapi-types-misc.h"
 #include "qemu/readline.h"
 
 extern Monitor *cur_mon;
@@ -16,7 +16,7 @@ extern Monitor *cur_mon;
 
 bool monitor_cur_is_qmp(void);
 
-void monitor_init_qmp_commands(void);
+void monitor_init_globals(void);
 void monitor_init(Chardev *chr, int flags);
 void monitor_cleanup(void);
 

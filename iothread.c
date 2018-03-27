@@ -18,7 +18,8 @@
 #include "block/aio.h"
 #include "block/block.h"
 #include "sysemu/iothread.h"
-#include "qmp-commands.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-misc.h"
 #include "qemu/error-report.h"
 #include "qemu/rcu.h"
 #include "qemu/main-loop.h"
@@ -30,11 +31,15 @@ typedef ObjectClass IOThreadClass;
 #define IOTHREAD_CLASS(klass) \
    OBJECT_CLASS_CHECK(IOThreadClass, klass, TYPE_IOTHREAD)
 
+#ifdef CONFIG_POSIX
 /* Benchmark results from 2016 on NVMe SSD drives show max polling times around
  * 16-32 microseconds yield IOPS improvements for both iodepth=1 and iodepth=32
  * workloads.
  */
 #define IOTHREAD_POLL_MAX_NS_DEFAULT 32768ULL
+#else
+#define IOTHREAD_POLL_MAX_NS_DEFAULT 0ULL
+#endif
 
 static __thread IOThread *my_iothread;
 
@@ -98,18 +103,6 @@ void iothread_stop(IOThread *iothread)
     iothread->stopping = true;
     aio_bh_schedule_oneshot(iothread->ctx, iothread_stop_bh, iothread);
     qemu_thread_join(&iothread->thread);
-}
-
-static int iothread_stop_iter(Object *object, void *opaque)
-{
-    IOThread *iothread;
-
-    iothread = (IOThread *)object_dynamic_cast(object, TYPE_IOTHREAD);
-    if (!iothread) {
-        return 0;
-    }
-    iothread_stop(iothread);
-    return 0;
 }
 
 static void iothread_instance_init(Object *obj)
@@ -330,25 +323,6 @@ IOThreadInfoList *qmp_query_iothreads(Error **errp)
 
     object_child_foreach(container, query_one_iothread, &prev);
     return head;
-}
-
-void iothread_stop_all(void)
-{
-    Object *container = object_get_objects_root();
-    BlockDriverState *bs;
-    BdrvNextIterator it;
-
-    for (bs = bdrv_first(&it); bs; bs = bdrv_next(&it)) {
-        AioContext *ctx = bdrv_get_aio_context(bs);
-        if (ctx == qemu_get_aio_context()) {
-            continue;
-        }
-        aio_context_acquire(ctx);
-        bdrv_set_aio_context(bs, qemu_get_aio_context());
-        aio_context_release(ctx);
-    }
-
-    object_child_foreach(container, iothread_stop_iter, NULL);
 }
 
 static gpointer iothread_g_main_context_init(gpointer opaque)

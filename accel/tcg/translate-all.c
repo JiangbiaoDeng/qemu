@@ -1736,37 +1736,32 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
         cpu_abort(cpu, "cpu_io_recompile: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    n = cpu->icount_decr.u16.low + tb->icount;
     cpu_restore_state_from_tb(cpu, tb, retaddr);
-    /* Calculate how many instructions had been executed before the fault
-       occurred.  */
-    n = n - cpu->icount_decr.u16.low;
-    /* Generate a new TB ending on the I/O insn.  */
-    n++;
+
     /* On MIPS and SH, delay slot instructions can only be restarted if
        they were already the first instruction in the TB.  If this is not
        the first instruction in a TB then re-execute the preceding
        branch.  */
+    n = 1;
 #if defined(TARGET_MIPS)
-    if ((env->hflags & MIPS_HFLAG_BMASK) != 0 && n > 1) {
+    if ((env->hflags & MIPS_HFLAG_BMASK) != 0
+        && env->active_tc.PC != tb->pc) {
         env->active_tc.PC -= (env->hflags & MIPS_HFLAG_B16 ? 2 : 4);
         cpu->icount_decr.u16.low++;
         env->hflags &= ~MIPS_HFLAG_BMASK;
+        n = 2;
     }
 #elif defined(TARGET_SH4)
     if ((env->flags & ((DELAY_SLOT | DELAY_SLOT_CONDITIONAL))) != 0
-            && n > 1) {
+        && env->pc != tb->pc) {
         env->pc -= 2;
         cpu->icount_decr.u16.low++;
         env->flags &= ~(DELAY_SLOT | DELAY_SLOT_CONDITIONAL);
+        n = 2;
     }
 #endif
-    /* This should never happen.  */
-    if (n > CF_COUNT_MASK) {
-        cpu_abort(cpu, "TB too big during recompile");
-    }
 
-    /* Adjust the execution state of the next TB.  */
+    /* Generate a new TB executing the I/O insn.  */
     cpu->cflags_next_tb = curr_cflags() | CF_LAST_IO | n;
 
     if (tb->cflags & CF_NOCACHE) {
@@ -2181,29 +2176,41 @@ int page_unprotect(target_ulong address, uintptr_t pc)
 
     /* if the page was really writable, then we change its
        protection back to writable */
-    if ((p->flags & PAGE_WRITE_ORG) && !(p->flags & PAGE_WRITE)) {
-        host_start = address & qemu_host_page_mask;
-        host_end = host_start + qemu_host_page_size;
-
-        prot = 0;
+    if (p->flags & PAGE_WRITE_ORG) {
         current_tb_invalidated = false;
-        for (addr = host_start ; addr < host_end ; addr += TARGET_PAGE_SIZE) {
-            p = page_find(addr >> TARGET_PAGE_BITS);
-            p->flags |= PAGE_WRITE;
-            prot |= p->flags;
-
-            /* and since the content will be modified, we must invalidate
-               the corresponding translated code. */
-            current_tb_invalidated |= tb_invalidate_phys_page(addr, pc);
-#ifdef CONFIG_USER_ONLY
-            if (DEBUG_TB_CHECK_GATE) {
-                tb_invalidate_check(addr);
+        if (p->flags & PAGE_WRITE) {
+            /* If the page is actually marked WRITE then assume this is because
+             * this thread raced with another one which got here first and
+             * set the page to PAGE_WRITE and did the TB invalidate for us.
+             */
+#ifdef TARGET_HAS_PRECISE_SMC
+            TranslationBlock *current_tb = tb_find_pc(pc);
+            if (current_tb) {
+                current_tb_invalidated = tb_cflags(current_tb) & CF_INVALID;
             }
 #endif
-        }
-        mprotect((void *)g2h(host_start), qemu_host_page_size,
-                 prot & PAGE_BITS);
+        } else {
+            host_start = address & qemu_host_page_mask;
+            host_end = host_start + qemu_host_page_size;
 
+            prot = 0;
+            for (addr = host_start; addr < host_end; addr += TARGET_PAGE_SIZE) {
+                p = page_find(addr >> TARGET_PAGE_BITS);
+                p->flags |= PAGE_WRITE;
+                prot |= p->flags;
+
+                /* and since the content will be modified, we must invalidate
+                   the corresponding translated code. */
+                current_tb_invalidated |= tb_invalidate_phys_page(addr, pc);
+#ifdef CONFIG_USER_ONLY
+                if (DEBUG_TB_CHECK_GATE) {
+                    tb_invalidate_check(addr);
+                }
+#endif
+            }
+            mprotect((void *)g2h(host_start), qemu_host_page_size,
+                     prot & PAGE_BITS);
+        }
         mmap_unlock();
         /* If current TB was invalidated return to main loop */
         return current_tb_invalidated ? 2 : 1;
