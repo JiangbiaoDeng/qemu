@@ -363,6 +363,27 @@ class VM(qtest.QEMUQtestMachine):
         return self.qmp('human-monitor-command',
                         command_line='qemu-io %s "%s"' % (drive, cmd))
 
+    def flatten_qmp_object(self, obj, output=None, basestr=''):
+        if output is None:
+            output = dict()
+        if isinstance(obj, list):
+            for i in range(len(obj)):
+                self.flatten_qmp_object(obj[i], output, basestr + str(i) + '.')
+        elif isinstance(obj, dict):
+            for key in obj:
+                self.flatten_qmp_object(obj[key], output, basestr + key + '.')
+        else:
+            output[basestr[:-1]] = obj # Strip trailing '.'
+        return output
+
+    def qmp_to_opts(self, obj):
+        obj = self.flatten_qmp_object(obj)
+        output_list = list()
+        for key in obj:
+            output_list += [key + '=' + obj[key]]
+        return ','.join(output_list)
+
+
 
 index_re = re.compile(r'([^\[]+)\[([^\]]+)\]')
 
@@ -389,26 +410,6 @@ class QMPTestCase(unittest.TestCase):
                 except IndexError:
                     self.fail('invalid index "%s" in path "%s" in "%s"' % (idx, path, str(d)))
         return d
-
-    def flatten_qmp_object(self, obj, output=None, basestr=''):
-        if output is None:
-            output = dict()
-        if isinstance(obj, list):
-            for i in range(len(obj)):
-                self.flatten_qmp_object(obj[i], output, basestr + str(i) + '.')
-        elif isinstance(obj, dict):
-            for key in obj:
-                self.flatten_qmp_object(obj[key], output, basestr + key + '.')
-        else:
-            output[basestr[:-1]] = obj # Strip trailing '.'
-        return output
-
-    def qmp_to_opts(self, obj):
-        obj = self.flatten_qmp_object(obj)
-        output_list = list()
-        for key in obj:
-            output_list += [key + '=' + obj[key]]
-        return ','.join(output_list)
 
     def assert_qmp_absent(self, d, path):
         try:
@@ -444,8 +445,8 @@ class QMPTestCase(unittest.TestCase):
         '''Asserts that the given filename is a json: filename and that its
            content is equal to the given reference object'''
         self.assertEqual(json_filename[:5], 'json:')
-        self.assertEqual(self.flatten_qmp_object(json.loads(json_filename[5:])),
-                         self.flatten_qmp_object(reference))
+        self.assertEqual(self.vm.flatten_qmp_object(json.loads(json_filename[5:])),
+                         self.vm.flatten_qmp_object(reference))
 
     def cancel_and_wait(self, drive='drive0', force=False, resume=False):
         '''Cancel a block job and wait for it to finish, returning the event'''
@@ -464,24 +465,26 @@ class QMPTestCase(unittest.TestCase):
                     self.assert_qmp(event, 'data/device', drive)
                     result = event
                     cancelled = True
+                elif event['event'] == 'JOB_STATUS_CHANGE':
+                    self.assert_qmp(event, 'data/id', drive)
+
 
         self.assert_no_active_block_jobs()
         return result
 
     def wait_until_completed(self, drive='drive0', check_offset=True):
         '''Wait for a block job to finish, returning the event'''
-        completed = False
-        while not completed:
+        while True:
             for event in self.vm.get_qmp_events(wait=True):
                 if event['event'] == 'BLOCK_JOB_COMPLETED':
                     self.assert_qmp(event, 'data/device', drive)
                     self.assert_qmp_absent(event, 'data/error')
                     if check_offset:
                         self.assert_qmp(event, 'data/offset', event['data']['len'])
-                    completed = True
-
-        self.assert_no_active_block_jobs()
-        return event
+                    self.assert_no_active_block_jobs()
+                    return event
+                elif event['event'] == 'JOB_STATUS_CHANGE':
+                    self.assert_qmp(event, 'data/id', drive)
 
     def wait_ready(self, drive='drive0'):
         '''Wait until a block job BLOCK_JOB_READY event'''
@@ -532,9 +535,17 @@ def notrun(reason):
     sys.exit(0)
 
 def verify_image_format(supported_fmts=[], unsupported_fmts=[]):
-    if supported_fmts and (imgfmt not in supported_fmts):
-        notrun('not suitable for this image format: %s' % imgfmt)
-    if unsupported_fmts and (imgfmt in unsupported_fmts):
+    assert not (supported_fmts and unsupported_fmts)
+
+    if 'generic' in supported_fmts and \
+            os.environ.get('IMGFMT_GENERIC', 'true') == 'true':
+        # similar to
+        #   _supported_fmt generic
+        # for bash tests
+        return
+
+    not_sup = supported_fmts and (imgfmt not in supported_fmts)
+    if not_sup or (imgfmt in unsupported_fmts):
         notrun('not suitable for this image format: %s' % imgfmt)
 
 def verify_platform(supported_oses=['linux']):
@@ -553,7 +564,8 @@ def verify_quorum():
     if not supports_quorum():
         notrun('quorum support missing')
 
-def main(supported_fmts=[], supported_oses=['linux'], supported_cache_modes=[]):
+def main(supported_fmts=[], supported_oses=['linux'], supported_cache_modes=[],
+         unsupported_fmts=[]):
     '''Run tests'''
 
     global debug
@@ -568,7 +580,7 @@ def main(supported_fmts=[], supported_oses=['linux'], supported_cache_modes=[]):
 
     debug = '-d' in sys.argv
     verbosity = 1
-    verify_image_format(supported_fmts)
+    verify_image_format(supported_fmts, unsupported_fmts)
     verify_platform(supported_oses)
     verify_cache_mode(supported_cache_modes)
 

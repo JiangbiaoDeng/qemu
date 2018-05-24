@@ -85,6 +85,16 @@ static inline uint32_t float_rel_to_flags(int res)
     return flags;
 }
 
+uint64_t HELPER(vfp_cmph_a64)(float16 x, float16 y, void *fp_status)
+{
+    return float_rel_to_flags(float16_compare_quiet(x, y, fp_status));
+}
+
+uint64_t HELPER(vfp_cmpeh_a64)(float16 x, float16 y, void *fp_status)
+{
+    return float_rel_to_flags(float16_compare(x, y, fp_status));
+}
+
 uint64_t HELPER(vfp_cmps_a64)(float32 x, float32 y, void *fp_status)
 {
     return float_rel_to_flags(float32_compare_quiet(x, y, fp_status));
@@ -366,7 +376,7 @@ float16 HELPER(frecpx_f16)(float16 a, void *fpstp)
         float16 nan = a;
         if (float16_is_signaling_nan(a, fpst)) {
             float_raise(float_flag_invalid, fpst);
-            nan = float16_maybe_silence_nan(a, fpst);
+            nan = float16_silence_nan(a, fpst);
         }
         if (fpst->default_nan_mode) {
             nan = float16_default_nan(fpst);
@@ -395,7 +405,7 @@ float32 HELPER(frecpx_f32)(float32 a, void *fpstp)
         float32 nan = a;
         if (float32_is_signaling_nan(a, fpst)) {
             float_raise(float_flag_invalid, fpst);
-            nan = float32_maybe_silence_nan(a, fpst);
+            nan = float32_silence_nan(a, fpst);
         }
         if (fpst->default_nan_mode) {
             nan = float32_default_nan(fpst);
@@ -424,7 +434,7 @@ float64 HELPER(frecpx_f64)(float64 a, void *fpstp)
         float64 nan = a;
         if (float64_is_signaling_nan(a, fpst)) {
             float_raise(float_flag_invalid, fpst);
-            nan = float64_maybe_silence_nan(a, fpst);
+            nan = float64_silence_nan(a, fpst);
         }
         if (fpst->default_nan_mode) {
             nan = float64_default_nan(fpst);
@@ -456,7 +466,6 @@ float32 HELPER(fcvtx_f64_to_f32)(float64 a, CPUARMState *env)
     set_float_rounding_mode(float_round_to_zero, &tstat);
     set_float_exception_flags(0, &tstat);
     r = float64_to_float32(a, &tstat);
-    r = float32_maybe_silence_nan(r, &tstat);
     exflags = get_float_exception_flags(&tstat);
     if (exflags & float_flag_inexact) {
         r = make_float32(float32_val(r) | 1);
@@ -634,6 +643,49 @@ uint64_t HELPER(paired_cmpxchg64_be_parallel)(CPUARMState *env, uint64_t addr,
                                      uint64_t new_lo, uint64_t new_hi)
 {
     return do_paired_cmpxchg64_be(env, addr, new_lo, new_hi, true, GETPC());
+}
+
+/* Writes back the old data into Rs.  */
+void HELPER(casp_le_parallel)(CPUARMState *env, uint32_t rs, uint64_t addr,
+                              uint64_t new_lo, uint64_t new_hi)
+{
+    uintptr_t ra = GETPC();
+#ifndef CONFIG_ATOMIC128
+    cpu_loop_exit_atomic(ENV_GET_CPU(env), ra);
+#else
+    Int128 oldv, cmpv, newv;
+
+    cmpv = int128_make128(env->xregs[rs], env->xregs[rs + 1]);
+    newv = int128_make128(new_lo, new_hi);
+
+    int mem_idx = cpu_mmu_index(env, false);
+    TCGMemOpIdx oi = make_memop_idx(MO_LEQ | MO_ALIGN_16, mem_idx);
+    oldv = helper_atomic_cmpxchgo_le_mmu(env, addr, cmpv, newv, oi, ra);
+
+    env->xregs[rs] = int128_getlo(oldv);
+    env->xregs[rs + 1] = int128_gethi(oldv);
+#endif
+}
+
+void HELPER(casp_be_parallel)(CPUARMState *env, uint32_t rs, uint64_t addr,
+                              uint64_t new_hi, uint64_t new_lo)
+{
+    uintptr_t ra = GETPC();
+#ifndef CONFIG_ATOMIC128
+    cpu_loop_exit_atomic(ENV_GET_CPU(env), ra);
+#else
+    Int128 oldv, cmpv, newv;
+
+    cmpv = int128_make128(env->xregs[rs + 1], env->xregs[rs]);
+    newv = int128_make128(new_lo, new_hi);
+
+    int mem_idx = cpu_mmu_index(env, false);
+    TCGMemOpIdx oi = make_memop_idx(MO_LEQ | MO_ALIGN_16, mem_idx);
+    oldv = helper_atomic_cmpxchgo_be_mmu(env, addr, cmpv, newv, oi, ra);
+
+    env->xregs[rs + 1] = int128_getlo(oldv);
+    env->xregs[rs] = int128_gethi(oldv);
+#endif
 }
 
 /*

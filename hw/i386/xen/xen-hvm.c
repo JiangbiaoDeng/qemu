@@ -95,7 +95,8 @@ typedef struct XenIOState {
     CPUState **cpu_by_vcpu_id;
     /* the evtchn port for polling the notification, */
     evtchn_port_t *ioreq_local_port;
-    /* evtchn local port for buffered io */
+    /* evtchn remote and local ports for buffered io */
+    evtchn_port_t bufioreq_remote_port;
     evtchn_port_t bufioreq_local_port;
     /* the evtchn fd for polling */
     xenevtchn_handle *xce_handle;
@@ -347,7 +348,7 @@ static int xen_add_to_physmap(XenIOState *state,
                               MemoryRegion *mr,
                               hwaddr offset_within_region)
 {
-    unsigned long i = 0;
+    unsigned long nr_pages;
     int rc = 0;
     XenPhysmap *physmap = NULL;
     hwaddr pfn, start_gpfn;
@@ -396,22 +397,26 @@ go_physmap:
 
     pfn = phys_offset >> TARGET_PAGE_BITS;
     start_gpfn = start_addr >> TARGET_PAGE_BITS;
-    for (i = 0; i < size >> TARGET_PAGE_BITS; i++) {
-        unsigned long idx = pfn + i;
-        xen_pfn_t gpfn = start_gpfn + i;
+    nr_pages = size >> TARGET_PAGE_BITS;
+    rc = xendevicemodel_relocate_memory(xen_dmod, xen_domid, nr_pages, pfn,
+                                        start_gpfn);
+    if (rc) {
+        int saved_errno = errno;
 
-        rc = xen_xc_domain_add_to_physmap(xen_xc, xen_domid, XENMAPSPACE_gmfn, idx, gpfn);
-        if (rc) {
-            DPRINTF("add_to_physmap MFN %"PRI_xen_pfn" to PFN %"
-                    PRI_xen_pfn" failed: %d (errno: %d)\n", idx, gpfn, rc, errno);
-            return -rc;
-        }
+        error_report("relocate_memory %lu pages from GFN %"HWADDR_PRIx
+                     " to GFN %"HWADDR_PRIx" failed: %s",
+                     nr_pages, pfn, start_gpfn, strerror(saved_errno));
+        errno = saved_errno;
+        return -1;
     }
 
-    xc_domain_pin_memory_cacheattr(xen_xc, xen_domid,
+    rc = xendevicemodel_pin_memory_cacheattr(xen_dmod, xen_domid,
                                    start_addr >> TARGET_PAGE_BITS,
                                    (start_addr + size - 1) >> TARGET_PAGE_BITS,
                                    XEN_DOMCTL_MEM_CACHEATTR_WB);
+    if (rc) {
+        error_report("pin_memory_cacheattr failed: %s", strerror(errno));
+    }
     return xen_save_physmap(state, physmap);
 }
 
@@ -419,7 +424,6 @@ static int xen_remove_from_physmap(XenIOState *state,
                                    hwaddr start_addr,
                                    ram_addr_t size)
 {
-    unsigned long i = 0;
     int rc = 0;
     XenPhysmap *physmap = NULL;
     hwaddr phys_offset = 0;
@@ -438,16 +442,17 @@ static int xen_remove_from_physmap(XenIOState *state,
     size >>= TARGET_PAGE_BITS;
     start_addr >>= TARGET_PAGE_BITS;
     phys_offset >>= TARGET_PAGE_BITS;
-    for (i = 0; i < size; i++) {
-        xen_pfn_t idx = start_addr + i;
-        xen_pfn_t gpfn = phys_offset + i;
+    rc = xendevicemodel_relocate_memory(xen_dmod, xen_domid, size, start_addr,
+                                        phys_offset);
+    if (rc) {
+        int saved_errno = errno;
 
-        rc = xen_xc_domain_add_to_physmap(xen_xc, xen_domid, XENMAPSPACE_gmfn, idx, gpfn);
-        if (rc) {
-            fprintf(stderr, "add_to_physmap MFN %"PRI_xen_pfn" to PFN %"
-                    PRI_xen_pfn" failed: %d (errno: %d)\n", idx, gpfn, rc, errno);
-            return -rc;
-        }
+        error_report("relocate_memory "RAM_ADDR_FMT" pages"
+                     " from GFN %"HWADDR_PRIx
+                     " to GFN %"HWADDR_PRIx" failed: %s",
+                     size, start_addr, phys_offset, strerror(saved_errno));
+        errno = saved_errno;
+        return -1;
     }
 
     QLIST_REMOVE(physmap, list);
@@ -1232,12 +1237,52 @@ static void xen_wakeup_notifier(Notifier *notifier, void *data)
     xc_set_hvm_param(xen_xc, xen_domid, HVM_PARAM_ACPI_S_STATE, 0);
 }
 
+static int xen_map_ioreq_server(XenIOState *state)
+{
+    xen_pfn_t ioreq_pfn;
+    xen_pfn_t bufioreq_pfn;
+    evtchn_port_t bufioreq_evtchn;
+    int rc;
+
+    rc = xen_get_ioreq_server_info(xen_domid, state->ioservid,
+                                   &ioreq_pfn, &bufioreq_pfn,
+                                   &bufioreq_evtchn);
+    if (rc < 0) {
+        error_report("failed to get ioreq server info: error %d handle=%p",
+                     errno, xen_xc);
+        return rc;
+    }
+
+    DPRINTF("shared page at pfn %lx\n", ioreq_pfn);
+    DPRINTF("buffered io page at pfn %lx\n", bufioreq_pfn);
+    DPRINTF("buffered io evtchn is %x\n", bufioreq_evtchn);
+
+    state->shared_page = xenforeignmemory_map(xen_fmem, xen_domid,
+                                              PROT_READ | PROT_WRITE,
+                                              1, &ioreq_pfn, NULL);
+    if (state->shared_page == NULL) {
+        error_report("map shared IO page returned error %d handle=%p",
+                     errno, xen_xc);
+        return -1;
+    }
+
+    state->buffered_io_page = xenforeignmemory_map(xen_fmem, xen_domid,
+                                                   PROT_READ | PROT_WRITE,
+                                                   1, &bufioreq_pfn, NULL);
+    if (state->buffered_io_page == NULL) {
+        error_report("map buffered IO page returned error %d", errno);
+        return -1;
+    }
+
+    state->bufioreq_remote_port = bufioreq_evtchn;
+
+    return 0;
+}
+
 void xen_hvm_init(PCMachineState *pcms, MemoryRegion **ram_memory)
 {
     int i, rc;
     xen_pfn_t ioreq_pfn;
-    xen_pfn_t bufioreq_pfn;
-    evtchn_port_t bufioreq_evtchn;
     XenIOState *state;
 
     state = g_malloc0(sizeof (XenIOState));
@@ -1254,14 +1299,6 @@ void xen_hvm_init(PCMachineState *pcms, MemoryRegion **ram_memory)
         goto err;
     }
 
-    if (xen_domid_restrict) {
-        rc = xen_restrict(xen_domid);
-        if (rc < 0) {
-            error_report("failed to restrict: error %d", errno);
-            goto err;
-        }
-    }
-
     xen_create_ioreq_server(xen_domid, &state->ioservid);
 
     state->exit.notify = xen_exit_notifier;
@@ -1273,25 +1310,8 @@ void xen_hvm_init(PCMachineState *pcms, MemoryRegion **ram_memory)
     state->wakeup.notify = xen_wakeup_notifier;
     qemu_register_wakeup_notifier(&state->wakeup);
 
-    rc = xen_get_ioreq_server_info(xen_domid, state->ioservid,
-                                   &ioreq_pfn, &bufioreq_pfn,
-                                   &bufioreq_evtchn);
+    rc = xen_map_ioreq_server(state);
     if (rc < 0) {
-        error_report("failed to get ioreq server info: error %d handle=%p",
-                     errno, xen_xc);
-        goto err;
-    }
-
-    DPRINTF("shared page at pfn %lx\n", ioreq_pfn);
-    DPRINTF("buffered io page at pfn %lx\n", bufioreq_pfn);
-    DPRINTF("buffered io evtchn is %x\n", bufioreq_evtchn);
-
-    state->shared_page = xenforeignmemory_map(xen_fmem, xen_domid,
-                                              PROT_READ|PROT_WRITE,
-                                              1, &ioreq_pfn, NULL);
-    if (state->shared_page == NULL) {
-        error_report("map shared IO page returned error %d handle=%p",
-                     errno, xen_xc);
         goto err;
     }
 
@@ -1309,14 +1329,6 @@ void xen_hvm_init(PCMachineState *pcms, MemoryRegion **ram_memory)
     } else if (rc != -ENOSYS) {
         error_report("get vmport regs pfn returned error %d, rc=%d",
                      errno, rc);
-        goto err;
-    }
-
-    state->buffered_io_page = xenforeignmemory_map(xen_fmem, xen_domid,
-                                                   PROT_READ|PROT_WRITE,
-                                                   1, &bufioreq_pfn, NULL);
-    if (state->buffered_io_page == NULL) {
-        error_report("map buffered IO page returned error %d", errno);
         goto err;
     }
 
@@ -1344,7 +1356,7 @@ void xen_hvm_init(PCMachineState *pcms, MemoryRegion **ram_memory)
     }
 
     rc = xenevtchn_bind_interdomain(state->xce_handle, xen_domid,
-                                    bufioreq_evtchn);
+                                    state->bufioreq_remote_port);
     if (rc == -1) {
         error_report("buffered evtchn bind error %d", errno);
         goto err;
@@ -1394,13 +1406,26 @@ void destroy_hvm_domain(bool reboot)
 {
     xc_interface *xc_handle;
     int sts;
+    int rc;
+
+    unsigned int reason = reboot ? SHUTDOWN_reboot : SHUTDOWN_poweroff;
+
+    if (xen_dmod) {
+        rc = xendevicemodel_shutdown(xen_dmod, xen_domid, reason);
+        if (!rc) {
+            return;
+        }
+        if (errno != ENOTTY /* old Xen */) {
+            perror("xendevicemodel_shutdown failed");
+        }
+        /* well, try the old thing then */
+    }
 
     xc_handle = xc_interface_open(0, 0, 0);
     if (xc_handle == NULL) {
         fprintf(stderr, "Cannot acquire xenctrl handle\n");
     } else {
-        sts = xc_domain_shutdown(xc_handle, xen_domid,
-                                 reboot ? SHUTDOWN_reboot : SHUTDOWN_poweroff);
+        sts = xc_domain_shutdown(xc_handle, xen_domid, reason);
         if (sts != 0) {
             fprintf(stderr, "xc_domain_shutdown failed to issue %s, "
                     "sts %d, %s\n", reboot ? "reboot" : "poweroff",

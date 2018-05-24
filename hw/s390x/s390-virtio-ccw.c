@@ -93,7 +93,7 @@ static const char *const reset_dev_types[] = {
     "diag288",
 };
 
-void subsystem_reset(void)
+static void subsystem_reset(void)
 {
     DeviceState *dev;
     int i;
@@ -246,6 +246,7 @@ static void s390_init_ipl_dev(const char *kernel_filename,
 {
     Object *new = object_new(TYPE_S390_IPL);
     DeviceState *dev = DEVICE(new);
+    char *netboot_fw_prop;
 
     if (kernel_filename) {
         qdev_prop_set_string(dev, "kernel", kernel_filename);
@@ -256,9 +257,11 @@ static void s390_init_ipl_dev(const char *kernel_filename,
     qdev_prop_set_string(dev, "cmdline", kernel_cmdline);
     qdev_prop_set_string(dev, "firmware", firmware);
     qdev_prop_set_bit(dev, "enforce_bios", enforce_bios);
-    if (!strlen(object_property_get_str(new, "netboot_fw", &error_abort))) {
+    netboot_fw_prop = object_property_get_str(new, "netboot_fw", &error_abort);
+    if (!strlen(netboot_fw_prop)) {
         qdev_prop_set_string(dev, "netboot_fw", netboot_fw);
     }
+    g_free(netboot_fw_prop);
     object_property_add_child(qdev_get_machine(), TYPE_S390_IPL,
                               new, NULL);
     object_unref(new);
@@ -283,6 +286,15 @@ static void s390_create_virtio_net(BusState *bus, const char *name)
         qdev_set_nic_properties(dev, nd);
         qdev_init_nofail(dev);
     }
+}
+
+static void s390_create_sclpconsole(const char *type, Chardev *chardev)
+{
+    DeviceState *dev;
+
+    dev = qdev_create(sclp_get_event_facility_bus(), type);
+    qdev_prop_set_chr(dev, "chardev", chardev);
+    qdev_init_nofail(dev);
 }
 
 static void ccw_init(MachineState *machine)
@@ -343,6 +355,14 @@ static void ccw_init(MachineState *machine)
     /* Create VirtIO network adapters */
     s390_create_virtio_net(BUS(css_bus), "virtio-net-ccw");
 
+    /* init consoles */
+    if (serial_hd(0)) {
+        s390_create_sclpconsole("sclpconsole", serial_hd(0));
+    }
+    if (serial_hd(1)) {
+        s390_create_sclpconsole("sclplmconsole", serial_hd(1));
+    }
+
     /* Register savevm handler for guest TOD clock */
     register_savevm_live(NULL, "todclock", 0, 1, &savevm_gtod, NULL);
 }
@@ -361,17 +381,54 @@ static void s390_cpu_plug(HotplugHandler *hotplug_dev,
     }
 }
 
+static inline void s390_do_cpu_ipl(CPUState *cs, run_on_cpu_data arg)
+{
+    S390CPU *cpu = S390_CPU(cs);
+
+    s390_ipl_prepare_cpu(cpu);
+    s390_cpu_set_state(S390_CPU_STATE_OPERATING, cpu);
+}
+
 static void s390_machine_reset(void)
 {
-    S390CPU *ipl_cpu = S390_CPU(qemu_get_cpu(0));
+    enum s390_reset reset_type;
+    CPUState *cs, *t;
 
+    /* get the reset parameters, reset them once done */
+    s390_ipl_get_reset_request(&cs, &reset_type);
+
+    /* all CPUs are paused and synchronized at this point */
     s390_cmma_reset();
-    qemu_devices_reset();
-    s390_crypto_reset();
 
-    /* all cpus are stopped - configure and start the ipl cpu only */
-    s390_ipl_prepare_cpu(ipl_cpu);
-    s390_cpu_set_state(S390_CPU_STATE_OPERATING, ipl_cpu);
+    switch (reset_type) {
+    case S390_RESET_EXTERNAL:
+    case S390_RESET_REIPL:
+        qemu_devices_reset();
+        s390_crypto_reset();
+
+        /* configure and start the ipl CPU only */
+        run_on_cpu(cs, s390_do_cpu_ipl, RUN_ON_CPU_NULL);
+        break;
+    case S390_RESET_MODIFIED_CLEAR:
+        CPU_FOREACH(t) {
+            run_on_cpu(t, s390_do_cpu_full_reset, RUN_ON_CPU_NULL);
+        }
+        subsystem_reset();
+        s390_crypto_reset();
+        run_on_cpu(cs, s390_do_cpu_load_normal, RUN_ON_CPU_NULL);
+        break;
+    case S390_RESET_LOAD_NORMAL:
+        CPU_FOREACH(t) {
+            run_on_cpu(t, s390_do_cpu_reset, RUN_ON_CPU_NULL);
+        }
+        subsystem_reset();
+        run_on_cpu(cs, s390_do_cpu_initial_reset, RUN_ON_CPU_NULL);
+        run_on_cpu(cs, s390_do_cpu_load_normal, RUN_ON_CPU_NULL);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    s390_ipl_clear_reset_request();
 }
 
 static void s390_machine_device_plug(HotplugHandler *hotplug_dev,
@@ -467,12 +524,11 @@ static void ccw_machine_class_init(ObjectClass *oc, void *data)
     mc->block_default_type = IF_VIRTIO;
     mc->no_cdrom = 1;
     mc->no_floppy = 1;
-    mc->no_serial = 1;
     mc->no_parallel = 1;
     mc->no_sdcard = 1;
-    mc->use_sclp = 1;
     mc->max_cpus = S390_MAX_CPUS;
     mc->has_hotpluggable_cpus = true;
+    assert(!mc->get_hotplug_handler);
     mc->get_hotplug_handler = s390_get_hotplug_handler;
     mc->cpu_index_to_instance_props = s390_cpu_index_to_props;
     mc->possible_cpu_arch_ids = s390_possible_cpu_arch_ids;
@@ -668,6 +724,9 @@ bool css_migration_enabled(void)
     }                                                                         \
     type_init(ccw_machine_register_##suffix)
 
+#define CCW_COMPAT_2_12 \
+        HW_COMPAT_2_12
+
 #define CCW_COMPAT_2_11 \
         HW_COMPAT_2_11 \
         {\
@@ -753,14 +812,26 @@ bool css_migration_enabled(void)
             .value    = "0",\
         },
 
+static void ccw_machine_2_13_instance_options(MachineState *machine)
+{
+}
+
+static void ccw_machine_2_13_class_options(MachineClass *mc)
+{
+}
+DEFINE_CCW_MACHINE(2_13, "2.13", true);
+
 static void ccw_machine_2_12_instance_options(MachineState *machine)
 {
+    ccw_machine_2_13_instance_options(machine);
 }
 
 static void ccw_machine_2_12_class_options(MachineClass *mc)
 {
+    ccw_machine_2_13_class_options(mc);
+    SET_MACHINE_COMPAT(mc, CCW_COMPAT_2_12);
 }
-DEFINE_CCW_MACHINE(2_12, "2.12", true);
+DEFINE_CCW_MACHINE(2_12, "2.12", false);
 
 static void ccw_machine_2_11_instance_options(MachineState *machine)
 {

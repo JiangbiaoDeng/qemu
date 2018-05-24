@@ -52,27 +52,27 @@ static void test_malformed(QTestState *qts)
     /* Not even a dictionary */
     resp = qtest_qmp(qts, "null");
     g_assert_cmpstr(get_error_class(resp), ==, "GenericError");
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* No "execute" key */
     resp = qtest_qmp(qts, "{}");
     g_assert_cmpstr(get_error_class(resp), ==, "GenericError");
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* "execute" isn't a string */
     resp = qtest_qmp(qts, "{ 'execute': true }");
     g_assert_cmpstr(get_error_class(resp), ==, "GenericError");
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* "arguments" isn't a dictionary */
     resp = qtest_qmp(qts, "{ 'execute': 'no-such-cmd', 'arguments': [] }");
     g_assert_cmpstr(get_error_class(resp), ==, "GenericError");
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* extra key */
     resp = qtest_qmp(qts, "{ 'execute': 'no-such-cmd', 'extra': true }");
     g_assert_cmpstr(get_error_class(resp), ==, "GenericError");
-    QDECREF(resp);
+    qobject_unref(resp);
 }
 
 static void test_qmp_protocol(void)
@@ -81,7 +81,7 @@ static void test_qmp_protocol(void)
     QList *capabilities;
     QTestState *qts;
 
-    qts = qtest_init_without_qmp_handshake(common_args);
+    qts = qtest_init_without_qmp_handshake(false, common_args);
 
     /* Test greeting */
     resp = qtest_qmp_receive(qts);
@@ -90,11 +90,12 @@ static void test_qmp_protocol(void)
     test_version(qdict_get(q, "version"));
     capabilities = qdict_get_qlist(q, "capabilities");
     g_assert(capabilities && qlist_empty(capabilities));
+    qobject_unref(resp);
 
     /* Test valid command before handshake */
     resp = qtest_qmp(qts, "{ 'execute': 'query-version' }");
     g_assert_cmpstr(get_error_class(resp), ==, "CommandNotFound");
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* Test malformed commands before handshake */
     test_malformed(qts);
@@ -103,17 +104,17 @@ static void test_qmp_protocol(void)
     resp = qtest_qmp(qts, "{ 'execute': 'qmp_capabilities' }");
     ret = qdict_get_qdict(resp, "return");
     g_assert(ret && !qdict_size(ret));
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* Test repeated handshake */
     resp = qtest_qmp(qts, "{ 'execute': 'qmp_capabilities' }");
     g_assert_cmpstr(get_error_class(resp), ==, "CommandNotFound");
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* Test valid command */
     resp = qtest_qmp(qts, "{ 'execute': 'query-version' }");
     test_version(qdict_get(resp, "return"));
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* Test malformed commands */
     test_malformed(qts);
@@ -123,13 +124,94 @@ static void test_qmp_protocol(void)
     ret = qdict_get_qdict(resp, "return");
     g_assert(ret);
     g_assert_cmpstr(qdict_get_try_str(resp, "id"), ==, "cookie#1");
-    QDECREF(resp);
+    qobject_unref(resp);
 
     /* Test command failure with 'id' */
     resp = qtest_qmp(qts, "{ 'execute': 'human-monitor-command', 'id': 2 }");
     g_assert_cmpstr(get_error_class(resp), ==, "GenericError");
     g_assert_cmpint(qdict_get_int(resp, "id"), ==, 2);
-    QDECREF(resp);
+    qobject_unref(resp);
+
+    qtest_quit(qts);
+}
+
+/* Tests for Out-Of-Band support. */
+static void test_qmp_oob(void)
+{
+    QTestState *qts;
+    QDict *resp, *q;
+    int acks = 0;
+    const QListEntry *entry;
+    QList *capabilities;
+    QString *qstr;
+    const char *cmd_id;
+
+    qts = qtest_init_without_qmp_handshake(true, common_args);
+
+    /* Check the greeting message. */
+    resp = qtest_qmp_receive(qts);
+    q = qdict_get_qdict(resp, "QMP");
+    g_assert(q);
+    capabilities = qdict_get_qlist(q, "capabilities");
+    g_assert(capabilities && !qlist_empty(capabilities));
+    entry = qlist_first(capabilities);
+    g_assert(entry);
+    qstr = qobject_to(QString, entry->value);
+    g_assert(qstr);
+    g_assert_cmpstr(qstring_get_str(qstr), ==, "oob");
+    qobject_unref(resp);
+
+    /* Try a fake capability, it should fail. */
+    resp = qtest_qmp(qts,
+                     "{ 'execute': 'qmp_capabilities', "
+                     "  'arguments': { 'enable': [ 'cap-does-not-exist' ] } }");
+    g_assert(qdict_haskey(resp, "error"));
+    qobject_unref(resp);
+
+    /* Now, enable OOB in current QMP session, it should succeed. */
+    resp = qtest_qmp(qts,
+                     "{ 'execute': 'qmp_capabilities', "
+                     "  'arguments': { 'enable': [ 'oob' ] } }");
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    /*
+     * Try any command that does not support OOB but with OOB flag. We
+     * should get failure.
+     */
+    resp = qtest_qmp(qts,
+                     "{ 'execute': 'query-cpus',"
+                     "  'control': { 'run-oob': true } }");
+    g_assert(qdict_haskey(resp, "error"));
+    qobject_unref(resp);
+
+    /*
+     * First send the "x-oob-test" command with lock=true and
+     * oob=false, it should hang the dispatcher and main thread;
+     * later, we send another lock=false with oob=true to continue
+     * that thread processing.  Finally we should receive replies from
+     * both commands.
+     */
+    qtest_async_qmp(qts,
+                    "{ 'execute': 'x-oob-test',"
+                    "  'arguments': { 'lock': true }, "
+                    "  'id': 'lock-cmd'}");
+    qtest_async_qmp(qts,
+                    "{ 'execute': 'x-oob-test', "
+                    "  'arguments': { 'lock': false }, "
+                    "  'control': { 'run-oob': true }, "
+                    "  'id': 'unlock-cmd' }");
+
+    /* Ignore all events.  Wait for 2 acks */
+    while (acks < 2) {
+        resp = qtest_qmp_receive(qts);
+        cmd_id = qdict_get_str(resp, "id");
+        if (!g_strcmp0(cmd_id, "lock-cmd") ||
+            !g_strcmp0(cmd_id, "unlock-cmd")) {
+            acks++;
+        }
+        qobject_unref(resp);
+    }
 
     qtest_quit(qts);
 }
@@ -189,7 +271,7 @@ static void test_query(const void *data)
                                         -1, &error_abort),
                         ==, expected_error_class);
     }
-    QDECREF(resp);
+    qobject_unref(resp);
 
     qtest_end();
 }
@@ -239,7 +321,7 @@ static void qmp_schema_init(QmpSchema *schema)
     visit_type_SchemaInfoList(qiv, NULL, &schema->list, &error_abort);
     visit_free(qiv);
 
-    QDECREF(resp);
+    qobject_unref(resp);
     qtest_end();
 
     schema->hash = g_hash_table_new(g_str_hash, g_str_equal);
@@ -318,6 +400,7 @@ int main(int argc, char *argv[])
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("qmp/protocol", test_qmp_protocol);
+    qtest_add_func("qmp/oob", test_qmp_oob);
     qmp_schema_init(&schema);
     add_query_tests(&schema);
 

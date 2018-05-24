@@ -1226,7 +1226,8 @@ int vhdx_user_visible_write(BlockDriverState *bs, BDRVVHDXState *s)
 }
 
 static coroutine_fn int vhdx_co_writev(BlockDriverState *bs, int64_t sector_num,
-                                      int nb_sectors, QEMUIOVector *qiov)
+                                       int nb_sectors, QEMUIOVector *qiov,
+                                       int flags)
 {
     int ret = -ENOTSUP;
     BDRVVHDXState *s = bs->opaque;
@@ -1242,6 +1243,7 @@ static coroutine_fn int vhdx_co_writev(BlockDriverState *bs, int64_t sector_num,
     uint64_t bat_prior_offset = 0;
     bool bat_update = false;
 
+    assert(!flags);
     qemu_iovec_init(&hd_qiov, qiov->niov);
 
     qemu_co_mutex_lock(&s->lock);
@@ -1822,17 +1824,21 @@ static int coroutine_fn vhdx_co_create(BlockdevCreateOptions *opts,
     /* Validate options and set default values */
     image_size = vhdx_opts->size;
     if (image_size > VHDX_MAX_IMAGE_SIZE) {
-        error_setg_errno(errp, EINVAL, "Image size too large; max of 64TB");
+        error_setg(errp, "Image size too large; max of 64TB");
         return -EINVAL;
     }
 
     if (!vhdx_opts->has_log_size) {
         log_size = DEFAULT_LOG_SIZE;
     } else {
+        if (vhdx_opts->log_size > UINT32_MAX) {
+            error_setg(errp, "Log size must be smaller than 4 GB");
+            return -EINVAL;
+        }
         log_size = vhdx_opts->log_size;
     }
     if (log_size < MiB || (log_size % MiB) != 0) {
-        error_setg_errno(errp, EINVAL, "Log size must be a multiple of 1 MB");
+        error_setg(errp, "Log size must be a multiple of 1 MB");
         return -EINVAL;
     }
 
@@ -1874,12 +1880,15 @@ static int coroutine_fn vhdx_co_create(BlockdevCreateOptions *opts,
     }
 
     if (block_size < MiB || (block_size % MiB) != 0) {
-        error_setg_errno(errp, EINVAL, "Block size must be a multiple of 1 MB");
+        error_setg(errp, "Block size must be a multiple of 1 MB");
+        return -EINVAL;
+    }
+    if (!is_power_of_2(block_size)) {
+        error_setg(errp, "Block size must be a power of two");
         return -EINVAL;
     }
     if (block_size > VHDX_BLOCK_SIZE_MAX) {
-        error_setg_errno(errp, EINVAL, "Block size must not exceed %d",
-                         VHDX_BLOCK_SIZE_MAX);
+        error_setg(errp, "Block size must not exceed %d", VHDX_BLOCK_SIZE_MAX);
         return -EINVAL;
     }
 
@@ -1996,7 +2005,7 @@ static int coroutine_fn vhdx_co_create_opts(const char *filename,
     qdict_put_str(qdict, "file", bs->node_name);
 
     qobj = qdict_crumple(qdict, errp);
-    QDECREF(qdict);
+    qobject_unref(qdict);
     qdict = qobject_to(QDict, qobj);
     if (qdict == NULL) {
         ret = -EINVAL;
@@ -2042,7 +2051,7 @@ static int coroutine_fn vhdx_co_create_opts(const char *filename,
     ret = vhdx_co_create(create_options, errp);
 
 fail:
-    QDECREF(qdict);
+    qobject_unref(qdict);
     bdrv_unref(bs);
     qapi_free_BlockdevCreateOptions(create_options);
     return ret;

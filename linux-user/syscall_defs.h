@@ -435,6 +435,7 @@ int do_sigaction(int sig, const struct target_sigaction *act,
 #define TARGET_SA_NODEFER      0x20u
 #define TARGET_SA_RESETHAND    4u
 #define TARGET_ARCH_HAS_SA_RESTORER 1
+#define TARGET_ARCH_HAS_KA_RESTORER 1
 #elif defined(TARGET_MIPS)
 #define TARGET_SA_NOCLDSTOP	0x00000001
 #define TARGET_SA_NOCLDWAIT	0x00010000
@@ -742,6 +743,9 @@ struct target_sigaction {
         abi_ulong sa_restorer;
 #endif
         target_sigset_t sa_mask;
+#ifdef TARGET_ARCH_HAS_KA_RESTORER
+        abi_ulong ka_restorer;
+#endif
 };
 #endif
 
@@ -2437,6 +2441,15 @@ struct target_statfs64 {
 #define TARGET_F_SETLKW        7
 #define TARGET_F_GETOWN        11       /*  for sockets. */
 #define TARGET_F_SETOWN        12       /*  for sockets. */
+#elif defined(TARGET_SPARC)
+#define TARGET_F_RDLCK         1
+#define TARGET_F_WRLCK         2
+#define TARGET_F_UNLCK         3
+#define TARGET_F_GETOWN        5       /*  for sockets. */
+#define TARGET_F_SETOWN        6       /*  for sockets. */
+#define TARGET_F_GETLK         7
+#define TARGET_F_SETLK         8
+#define TARGET_F_SETLKW        9
 #else
 #define TARGET_F_GETLK         5
 #define TARGET_F_SETLK         6
@@ -2561,6 +2574,7 @@ struct target_statfs64 {
 #define TARGET_O_CLOEXEC      0x400000
 #define TARGET___O_SYNC       0x800000
 #define TARGET_O_PATH        0x1000000
+#define TARGET___O_TMPFILE   0x2000000
 #endif
 
 /* <asm-generic/fcntl.h> values follow.  */
@@ -2629,6 +2643,17 @@ struct target_statfs64 {
 #define TARGET_O_SYNC    (TARGET___O_SYNC | TARGET_O_DSYNC)
 #endif
 
+#if defined(TARGET_SPARC)
+#define TARGET_ARCH_FLOCK_PAD abi_short __unused;
+#define TARGET_ARCH_FLOCK64_PAD abi_short __unused;
+#elif defined(TARGET_MIPS)
+#define TARGET_ARCH_FLOCK_PAD abi_long pad[4];
+#define TARGET_ARCH_FLOCK64_PAD
+#else
+#define TARGET_ARCH_FLOCK_PAD
+#define TARGET_ARCH_FLOCK64_PAD
+#endif
+
 struct target_flock {
     short l_type;
     short l_whence;
@@ -2638,35 +2663,17 @@ struct target_flock {
     abi_long l_sysid;
 #endif
     int l_pid;
-#if defined(TARGET_MIPS)
-    abi_long pad[4];
-#endif
+    TARGET_ARCH_FLOCK_PAD
 };
 
 struct target_flock64 {
-    short  l_type;
-    short  l_whence;
-#if defined(TARGET_PPC) || defined(TARGET_X86_64) || defined(TARGET_MIPS) \
-    || defined(TARGET_SPARC) || defined(TARGET_HPPA) \
-    || defined(TARGET_MICROBLAZE) || defined(TARGET_TILEGX) \
-    || defined(TARGET_XTENSA)
-    int __pad;
-#endif
+    abi_short l_type;
+    abi_short l_whence;
     abi_llong l_start;
     abi_llong l_len;
-    int  l_pid;
-} QEMU_PACKED;
-
-#ifdef TARGET_ARM
-struct target_eabi_flock64 {
-    short  l_type;
-    short  l_whence;
-    int __pad;
-    abi_llong l_start;
-    abi_llong l_len;
-    int  l_pid;
-} QEMU_PACKED;
-#endif
+    abi_int   l_pid;
+    TARGET_ARCH_FLOCK64_PAD
+};
 
 struct target_f_owner_ex {
         int type;	/* Owner type of ID.  */

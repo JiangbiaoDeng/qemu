@@ -77,10 +77,6 @@
 #define DEFAULT_L2_CACHE_CLUSTERS 8 /* clusters */
 #define DEFAULT_L2_CACHE_BYTE_SIZE 1048576 /* bytes */
 
-/* The refblock cache needs only a fourth of the L2 cache size to cover as many
- * clusters */
-#define DEFAULT_L2_REFCOUNT_SIZE_RATIO 4
-
 #define DEFAULT_CLUSTER_SIZE 65536
 
 
@@ -298,6 +294,7 @@ typedef struct BDRVQcow2State {
     uint32_t nb_bitmaps;
     uint64_t bitmap_directory_size;
     uint64_t bitmap_directory_offset;
+    bool dirty_bitmaps_loaded;
 
     int flags;
     int qcow_version;
@@ -671,6 +668,8 @@ int qcow2_check_bitmaps_refcounts(BlockDriverState *bs, BdrvCheckResult *res,
                                   void **refcount_table,
                                   int64_t *refcount_table_size);
 bool qcow2_load_dirty_bitmaps(BlockDriverState *bs, Error **errp);
+int qcow2_reopen_bitmaps_rw_hint(BlockDriverState *bs, bool *header_updated,
+                                 Error **errp);
 int qcow2_reopen_bitmaps_rw(BlockDriverState *bs, Error **errp);
 void qcow2_store_persistent_dirty_bitmaps(BlockDriverState *bs, Error **errp);
 int qcow2_reopen_bitmaps_ro(BlockDriverState *bs, Error **errp);

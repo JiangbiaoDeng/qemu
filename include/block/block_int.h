@@ -126,6 +126,8 @@ struct BlockDriver {
 
     int (*bdrv_open)(BlockDriverState *bs, QDict *options, int flags,
                      Error **errp);
+
+    /* Protocol drivers should implement this instead of bdrv_open */
     int (*bdrv_file_open)(BlockDriverState *bs, QDict *options, int flags,
                           Error **errp);
     void (*bdrv_close)(BlockDriverState *bs);
@@ -139,11 +141,11 @@ struct BlockDriver {
     void (*bdrv_refresh_filename)(BlockDriverState *bs, QDict *options);
 
     /* aio */
-    BlockAIOCB *(*bdrv_aio_readv)(BlockDriverState *bs,
-        int64_t sector_num, QEMUIOVector *qiov, int nb_sectors,
+    BlockAIOCB *(*bdrv_aio_preadv)(BlockDriverState *bs,
+        uint64_t offset, uint64_t bytes, QEMUIOVector *qiov, int flags,
         BlockCompletionFunc *cb, void *opaque);
-    BlockAIOCB *(*bdrv_aio_writev)(BlockDriverState *bs,
-        int64_t sector_num, QEMUIOVector *qiov, int nb_sectors,
+    BlockAIOCB *(*bdrv_aio_pwritev)(BlockDriverState *bs,
+        uint64_t offset, uint64_t bytes, QEMUIOVector *qiov, int flags,
         BlockCompletionFunc *cb, void *opaque);
     BlockAIOCB *(*bdrv_aio_flush)(BlockDriverState *bs,
         BlockCompletionFunc *cb, void *opaque);
@@ -172,8 +174,6 @@ struct BlockDriver {
     int coroutine_fn (*bdrv_co_preadv)(BlockDriverState *bs,
         uint64_t offset, uint64_t bytes, QEMUIOVector *qiov, int flags);
     int coroutine_fn (*bdrv_co_writev)(BlockDriverState *bs,
-        int64_t sector_num, int nb_sectors, QEMUIOVector *qiov);
-    int coroutine_fn (*bdrv_co_writev_flags)(BlockDriverState *bs,
         int64_t sector_num, int nb_sectors, QEMUIOVector *qiov, int flags);
     /**
      * @offset: position in bytes to write at
@@ -251,6 +251,12 @@ struct BlockDriver {
      */
     int coroutine_fn (*bdrv_co_flush_to_os)(BlockDriverState *bs);
 
+    /*
+     * Drivers setting this field must be able to work with just a plain
+     * filename with '<protocol_name>:' as a prefix, and no other options.
+     * Options may be extracted from the filename by implementing
+     * bdrv_parse_filename.
+     */
     const char *protocol_name;
     int (*bdrv_truncate)(BlockDriverState *bs, int64_t offset,
                          PreallocMode prealloc, Error **errp);
@@ -650,10 +656,24 @@ struct BlockDriverState {
     /* I/O Limits */
     BlockLimits bl;
 
-    /* Flags honored during pwrite (so far: BDRV_REQ_FUA) */
+    /* Flags honored during pwrite (so far: BDRV_REQ_FUA,
+     * BDRV_REQ_WRITE_UNCHANGED).
+     * If a driver does not support BDRV_REQ_WRITE_UNCHANGED, those
+     * writes will be issued as normal writes without the flag set.
+     * This is important to note for drivers that do not explicitly
+     * request a WRITE permission for their children and instead take
+     * the same permissions as their parent did (this is commonly what
+     * block filters do).  Such drivers have to be aware that the
+     * parent may have taken a WRITE_UNCHANGED permission only and is
+     * issuing such requests.  Drivers either must make sure that
+     * these requests do not result in plain WRITE accesses (usually
+     * by supporting BDRV_REQ_WRITE_UNCHANGED, and then forwarding
+     * every incoming write request as-is, including potentially that
+     * flag), or they have to explicitly take the WRITE permission for
+     * their children. */
     unsigned int supported_write_flags;
     /* Flags honored during pwrite_zeroes (so far: BDRV_REQ_FUA,
-     * BDRV_REQ_MAY_UNMAP) */
+     * BDRV_REQ_MAY_UNMAP, BDRV_REQ_WRITE_UNCHANGED) */
     unsigned int supported_zero_flags;
 
     /* the following member gives a name to every node on the bs graph. */
@@ -1009,7 +1029,7 @@ BlockJob *backup_job_create(const char *job_id, BlockDriverState *bs,
                             BlockdevOnError on_target_error,
                             int creation_flags,
                             BlockCompletionFunc *cb, void *opaque,
-                            BlockJobTxn *txn, Error **errp);
+                            JobTxn *txn, Error **errp);
 
 void hmp_drive_add_node(Monitor *mon, const char *optstr);
 
